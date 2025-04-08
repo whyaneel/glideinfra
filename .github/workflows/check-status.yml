@@ -1,14 +1,14 @@
 name: Check EKS Cluster Status
 
 on:
-workflow_dispatch:
-schedule:
-# Run every day at midnight UTC
-- cron: '0 0 * * *'
+  workflow_dispatch:
+  schedule:
+    # Run every day at midnight UTC
+    - cron: '0 0 * * *'
 
 jobs:
-check-status:
-runs-on: ubuntu-latest
+  check-status:
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
@@ -21,11 +21,11 @@ runs-on: ubuntu-latest
             STATUS=$(cat cluster-status/status.txt)
             CLUSTER_NAME=$(cat cluster-status/name.txt)
             REGION=$(cat cluster-status/region.txt)
-            
+          
             echo "status=${STATUS}" >> $GITHUB_OUTPUT
             echo "cluster_name=${CLUSTER_NAME}" >> $GITHUB_OUTPUT
             echo "region=${REGION}" >> $GITHUB_OUTPUT
-            
+          
             if [[ -f "cluster-status/timestamp.txt" ]]; then
               TIMESTAMP=$(cat cluster-status/timestamp.txt)
               CURRENT_TIME=$(date +%s)
@@ -72,7 +72,7 @@ runs-on: ubuntu-latest
             if command -v gh &> /dev/null; then
               gh auth login --with-token <<< "${{ secrets.GITHUB_TOKEN }}"
               ISSUE_EXISTS=$(gh issue list --search "Long-running EKS cluster ${{ steps.cluster-details.outputs.cluster_name }}" --json number | jq '.[].number')
-              
+          
               if [[ -z "$ISSUE_EXISTS" ]]; then
                 gh issue create --title "Long-running EKS cluster: ${{ steps.cluster-details.outputs.cluster_name }}" \
                   --body "EKS cluster '${{ steps.cluster-details.outputs.cluster_name }}' has been running for ${{ steps.cluster-details.outputs.age_days }} days in region '${{ steps.cluster-details.outputs.region }}'.\n\nConsider destroying it if not in use to save costs.\n\nYou can destroy it by:\n1. Using the GitHub Actions workflow 'Destroy EKS Cluster'\n2. Adding [destroy-eks] to a commit message\n3. Running 'make destroy' locally" \

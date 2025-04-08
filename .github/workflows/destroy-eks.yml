@@ -1,0 +1,121 @@
+name: Destroy EKS Cluster
+
+on:
+  push:
+    branches:
+      - setup
+    paths:
+      - '.github/workflows/destroy-eks.yml'
+  workflow_dispatch:
+    inputs:
+      cluster_name:
+        description: 'EKS Cluster Name'
+        required: false
+        default: 'glide-api-cluster'
+      region:
+        description: 'AWS Region'
+        required: false
+        default: 'us-east-1'
+      force_destroy:
+        description: 'Force destroy'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  destroy-eks:
+    runs-on: ubuntu-latest
+    if: "contains(github.event.head_commit.message, '[destroy-eks]') || github.event_name == 'workflow_dispatch'"
+
+    env:
+      AWS_REGION: ${{ github.event.inputs.region || 'us-east-1' }}
+      TF_VAR_region: ${{ github.event.inputs.region || 'us-east-1' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Get Cluster Name
+        id: cluster-name
+        run: |
+          if [[ -f "cluster-status/name.txt" ]]; then
+            STORED_NAME=$(cat cluster-status/name.txt)
+            echo "stored_name=${STORED_NAME}" >> $GITHUB_OUTPUT
+          else
+            echo "stored_name=glide-api-cluster" >> $GITHUB_OUTPUT
+          fi
+          
+          # Use input if provided, otherwise use the stored name
+          CLUSTER_NAME="${{ github.event.inputs.cluster_name }}"
+          if [[ -z "$CLUSTER_NAME" ]]; then
+            CLUSTER_NAME="${STORED_NAME}"
+          fi
+          echo "cluster_name=${CLUSTER_NAME}" >> $GITHUB_OUTPUT
+          echo "Using cluster name: ${CLUSTER_NAME}"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.5.7"
+
+      - name: Check Cluster Status
+        id: check-status
+        continue-on-error: true
+        run: |
+          if aws eks describe-cluster --name "${{ steps.cluster-name.outputs.cluster_name }}" --region "${{ env.AWS_REGION }}"; then
+            echo "cluster_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "cluster_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Clean Kubernetes Resources
+        if: steps.check-status.outputs.cluster_exists == 'true'
+        continue-on-error: true
+        run: |
+          echo "Cleaning up Kubernetes resources before destroying cluster..."
+          aws eks update-kubeconfig --name "${{ steps.cluster-name.outputs.cluster_name }}" --region "${{ env.AWS_REGION }}"
+          kubectl delete service --all --all-namespaces
+          kubectl delete deployment --all --all-namespaces
+          kubectl delete pod --all --all-namespaces
+
+      - name: Terraform Init
+        working-directory: ./terraform
+        run: terraform init
+
+      - name: Terraform Destroy
+        working-directory: ./terraform
+        env:
+          TF_VAR_cluster_name: ${{ steps.cluster-name.outputs.cluster_name }}
+        run: terraform destroy -auto-approve
+
+      - name: Verify Destruction
+        continue-on-error: true
+        run: |
+          if ! aws eks describe-cluster --name "${{ steps.cluster-name.outputs.cluster_name }}" --region "${{ env.AWS_REGION }}"; then
+            echo "Cluster successfully destroyed!"
+          else
+            echo "WARNING: Cluster might still be in the process of being destroyed. Check the AWS Console."
+          fi
+
+      - name: Update Status File
+        run: |
+          mkdir -p cluster-status
+          echo "DESTROYED" > cluster-status/status.txt
+          echo "${{ steps.cluster-name.outputs.cluster_name }}" > cluster-status/name.txt
+          echo "${{ env.AWS_REGION }}" > cluster-status/region.txt
+          echo "$(date +%s)" > cluster-status/timestamp.txt
+
+      - name: Commit Status
+        run: |
+          git config --global user.name 'GitHub Actions'
+          git config --global user.email 'actions@github.com'
+          git add cluster-status/
+          git commit -m "Update cluster status to DESTROYED [skip ci]" || echo "No changes to commit"
+          git push

@@ -1,6 +1,6 @@
 .PHONY: setup destroy lint validate help
 
-CLUSTER_NAME ?= glideinfra-eks
+CLUSTER_NAME ?= glide-api-cluster
 REGION ?= us-east-1
 
 help:
@@ -14,7 +14,7 @@ help:
 	@echo "help      : Show this help message"
 	@echo ""
 	@echo "Environment Variables:"
-	@echo "CLUSTER_NAME : Name of the EKS cluster (default: glideinfra-eks)"
+	@echo "CLUSTER_NAME : Name of the EKS cluster (default: glide-api-cluster)"
 	@echo "REGION       : AWS region (default: us-east-1)"
 
 setup:

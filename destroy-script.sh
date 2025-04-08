@@ -11,7 +11,7 @@ echo -e "${RED}==== GlideInfra EKS Cluster Teardown ====${NC}"
 echo -e "${YELLOW}WARNING: This will destroy your EKS cluster and all resources created by Terraform${NC}"
 
 # Set variables
-CLUSTER_NAME=${1:-glideinfra-eks}
+CLUSTER_NAME=${1:-glide-api-cluster}
 REGION="us-east-1"
 
 # Ask for confirmation

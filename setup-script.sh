@@ -30,7 +30,7 @@ if ! aws sts get-caller-identity &> /dev/null; then
 fi
 
 # Set variables
-CLUSTER_NAME=${1:-glideinfra-eks}
+CLUSTER_NAME=${1:-glide-api-cluster}
 REGION="us-east-1"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 
