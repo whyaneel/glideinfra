@@ -96,3 +96,4 @@ jobs:
           git add cluster-status/
           git commit -m "Update cluster status to ACTIVE [skip ci]" || echo "No changes to commit"
           git push
+
