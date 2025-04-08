@@ -1,98 +1,139 @@
-name: Check EKS Cluster Status
+# GlideInfra
 
-on:
-workflow_dispatch:
-schedule:
-# Run every day at midnight UTC
-- cron: '0 0 * * *'
+A lightweight infrastructure setup for quickly provisioning and destroying AWS EKS clusters to minimize costs, with CI/CD integration.
 
-jobs:
-check-status:
-runs-on: ubuntu-latest
+## Overview
 
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+GlideInfra provides simple scripts and CI/CD workflows to:
+- Quickly provision a minimal EKS cluster in AWS (us-east-1)
+- Easily destroy the infrastructure when not in use to save costs
+- Support basic configuration customization
+- Control infrastructure through Git commits
 
-      - name: Get Cluster Details
-        id: cluster-details
-        run: |
-          if [[ -f "cluster-status/status.txt" && -f "cluster-status/name.txt" && -f "cluster-status/region.txt" ]]; then
-            STATUS=$(cat cluster-status/status.txt)
-            CLUSTER_NAME=$(cat cluster-status/name.txt)
-            REGION=$(cat cluster-status/region.txt)
-            
-            echo "status=${STATUS}" >> $GITHUB_OUTPUT
-            echo "cluster_name=${CLUSTER_NAME}" >> $GITHUB_OUTPUT
-            echo "region=${REGION}" >> $GITHUB_OUTPUT
-            
-            if [[ -f "cluster-status/timestamp.txt" ]]; then
-              TIMESTAMP=$(cat cluster-status/timestamp.txt)
-              CURRENT_TIME=$(date +%s)
-              DIFF=$((CURRENT_TIME - TIMESTAMP))
-              DAYS=$((DIFF / 86400))
-              echo "age_days=${DAYS}" >> $GITHUB_OUTPUT
-            else
-              echo "age_days=unknown" >> $GITHUB_OUTPUT
-            fi
-          else
-            echo "status=UNKNOWN" >> $GITHUB_OUTPUT
-            echo "cluster_name=unknown" >> $GITHUB_OUTPUT
-            echo "region=unknown" >> $GITHUB_OUTPUT
-            echo "age_days=unknown" >> $GITHUB_OUTPUT
-          fi
+## Prerequisites
 
-      - name: Configure AWS credentials
-        if: steps.cluster-details.outputs.status == 'ACTIVE'
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ steps.cluster-details.outputs.region }}
+- AWS CLI installed and configured
+- Terraform ≥ 1.0.0
+- kubectl
+- [eksctl](https://eksctl.io/) (optional)
+- GitHub repository with Actions enabled
 
-      - name: Verify Cluster Existence
-        if: steps.cluster-details.outputs.status == 'ACTIVE'
-        id: verify-cluster
-        continue-on-error: true
-        run: |
-          if aws eks describe-cluster --name "${{ steps.cluster-details.outputs.cluster_name }}" --region "${{ steps.cluster-details.outputs.region }}"; then
-            echo "cluster_exists=true" >> $GITHUB_OUTPUT
-          else
-            echo "cluster_exists=false" >> $GITHUB_OUTPUT
-          fi
+## Quick Start
 
-      - name: Send Notification for Long-Running Clusters
-        if: steps.cluster-details.outputs.status == 'ACTIVE' && steps.verify-cluster.outputs.cluster_exists == 'true' && steps.cluster-details.outputs.age_days != 'unknown' && steps.cluster-details.outputs.age_days > 2
-        run: |
-          echo "::warning::EKS cluster '${{ steps.cluster-details.outputs.cluster_name }}' has been running for ${{ steps.cluster-details.outputs.age_days }} days. Consider destroying it if not in use to save costs."
-          
-          # Create issue if cluster is older than 3 days
-          if [[ ${{ steps.cluster-details.outputs.age_days }} -gt 3 ]]; then
-            # Using GitHub CLI if available
-            if command -v gh &> /dev/null; then
-              gh auth login --with-token <<< "${{ secrets.GITHUB_TOKEN }}"
-              ISSUE_EXISTS=$(gh issue list --search "Long-running EKS cluster ${{ steps.cluster-details.outputs.cluster_name }}" --json number | jq '.[].number')
-              
-              if [[ -z "$ISSUE_EXISTS" ]]; then
-                gh issue create --title "Long-running EKS cluster: ${{ steps.cluster-details.outputs.cluster_name }}" \
-                  --body "EKS cluster '${{ steps.cluster-details.outputs.cluster_name }}' has been running for ${{ steps.cluster-details.outputs.age_days }} days in region '${{ steps.cluster-details.outputs.region }}'.\n\nConsider destroying it if not in use to save costs.\n\nYou can destroy it by:\n1. Using the GitHub Actions workflow 'Destroy EKS Cluster'\n2. Adding [destroy-eks] to a commit message\n3. Running 'make destroy' locally" \
-                  --label "cost-alert"
-              fi
-            fi
-          fi
+### Setting up the EKS cluster
 
-      - name: Update Status if Cluster Not Found
-        if: steps.cluster-details.outputs.status == 'ACTIVE' && steps.verify-cluster.outputs.cluster_exists == 'false'
-        run: |
-          echo "Cluster marked as ACTIVE but doesn't exist. Updating status..."
-          mkdir -p cluster-status
-          echo "DESTROYED" > cluster-status/status.txt
-          echo "${{ steps.cluster-details.outputs.cluster_name }}" > cluster-status/name.txt
-          echo "${{ steps.cluster-details.outputs.region }}" > cluster-status/region.txt
-          echo "$(date +%s)" > cluster-status/timestamp.txt
-          
-          git config --global user.name 'GitHub Actions'
-          git config --global user.email 'actions@github.com'
-          git add cluster-status/
-          git commit -m "Update cluster status to DESTROYED (auto-detected) [skip ci]" || echo "No changes to commit"
-          git push
+You can set up an EKS cluster in multiple ways:
+
+#### 1. Using Git Commit (CI/CD)
+
+Add `[setup-eks]` to your commit message to trigger cluster creation:
+
+```bash
+git commit -m "Update infrastructure configuration [setup-eks]"
+git push
+```
+
+#### 2. Using GitHub Actions UI
+
+1. Go to the "Actions" tab in your GitHub repository
+2. Select the "Setup EKS Cluster" workflow
+3. Click "Run workflow"
+4. Fill in the parameters or use defaults
+5. Click "Run workflow" again
+
+#### 3. Using Local Scripts
+
+```bash
+# Make the setup script executable
+chmod +x setup_glideinfra.sh
+
+# Run the setup script
+./setup_glideinfra.sh
+```
+
+### Destroying the EKS cluster
+
+Similarly, you can destroy the cluster in multiple ways:
+
+#### 1. Using Git Commit (CI/CD)
+
+Add `[destroy-eks]` to your commit message:
+
+```bash
+git commit -m "Cleanup infrastructure [destroy-eks]"
+git push
+```
+
+#### 2. Using GitHub Actions UI
+
+1. Go to the "Actions" tab in your GitHub repository
+2. Select the "Destroy EKS Cluster" workflow
+3. Click "Run workflow"
+4. Confirm the parameters
+5. Click "Run workflow" again
+
+#### 3. Using Local Scripts
+
+```bash
+# Make the destroy script executable
+chmod +x destroy_glideinfra.sh
+
+# Run the destroy script
+./destroy_glideinfra.sh
+```
+
+## CI/CD Integration
+
+This repository includes three GitHub Actions workflows:
+
+1. **Setup EKS Cluster** (`.github/workflows/setup-eks.yml`)
+   - Triggered by `[setup-eks]` in commit messages
+   - Can be manually triggered from GitHub UI
+   - Creates and configures the EKS cluster
+
+2. **Destroy EKS Cluster** (`.github/workflows/destroy-eks.yml`)
+   - Triggered by `[destroy-eks]` in commit messages
+   - Can be manually triggered from GitHub UI
+   - Destroys the EKS cluster and all resources
+
+3. **Check EKS Cluster Status** (`.github/workflows/check-status.yml`)
+   - Runs daily to check if clusters are still running
+   - Creates issues for long-running clusters (> 3 days)
+   - Updates status if clusters no longer exist
+
+### Required GitHub Secrets
+
+You must set the following secrets in your GitHub repository:
+
+- `AWS_ACCESS_KEY_ID`: Your AWS access key
+- `AWS_SECRET_ACCESS_KEY`: Your AWS secret key
+
+These credentials should have appropriate permissions to create and manage EKS clusters.
+
+## Cost Saving Strategies
+
+This repo implements several cost-saving approaches:
+1. Minimal node configuration (2 small t3.medium nodes by default)
+2. Easy teardown when not in use
+3. Spot instance support (optional)
+4. No unnecessary AWS resources
+5. Automated alerts for long-running clusters
+
+## Configuration
+
+Edit the `terraform/variables.tf` file to customize your deployment:
+
+- Cluster name
+- Node instance type
+- Number of nodes
+- Other EKS configuration
+
+## Known Limitations
+
+- Designed for development/testing purposes, not production workloads
+- Uses default networking configuration
+- Simple security setup (should be enhanced for production use)
+
+## License
+
+MIT
