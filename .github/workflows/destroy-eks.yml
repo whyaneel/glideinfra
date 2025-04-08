@@ -104,7 +104,7 @@ jobs:
       - name: Commit Status
         run: |
           git config --global user.name 'GitHub Actions'
-          git config --global user.email 'actions@github.com'
+          git config --global user.email 'whyaneel@gmail.com'
           git add cluster-status/
           git commit -m "Update cluster status to DESTROYED [skip ci]" || echo "No changes to commit"
           git push
