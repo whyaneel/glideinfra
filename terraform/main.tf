@@ -50,6 +50,14 @@ module "vpc" {
   tags = local.tags
 }
 
+# Create CloudWatch Log Group with unique name
+resource "aws_cloudwatch_log_group" "eks" {
+  # Add unique identifier to avoid conflicts
+  name              = "/aws/eks/${local.cluster_name}-${random_string.suffix.result}/cluster"
+  retention_in_days = 7
+  tags              = local.tags
+}
+
 # EKS Cluster
 module "eks" {
   source  = "terraform-aws-modules/eks/aws"
@@ -60,6 +68,17 @@ module "eks" {
 
   vpc_id     = module.vpc.vpc_id
   subnet_ids = module.vpc.private_subnets
+
+  # Use our custom CloudWatch log group
+  create_cloudwatch_log_group = false
+  cluster_enabled_log_types   = ["api", "audit", "authenticator", "controllerManager", "scheduler"]
+  cloudwatch_log_group_kms_key_id = null
+  cloudwatch_log_group_retention_in_days = 7
+
+  # Override the default log group with our custom one
+  cluster_additional_security_group_ids = []
+  cluster_endpoint_private_access = true
+  cluster_endpoint_public_access  = true
 
   # Use spot instances for cost savings
   eks_managed_node_groups = {
@@ -73,14 +92,21 @@ module "eks" {
       max_size     = var.max_nodes
       desired_size = var.desired_nodes
 
-      # Enable auto-scaling (adds cost but helps manage resources)
+      # IAM - use separate IAM policies instead of inline policies
       create_iam_role = true
+      iam_role_name   = "${local.cluster_name}-node-group-role"
+      iam_role_use_name_prefix = false
+
+      # Avoid inline policies - instead create explicit IAM policies
       iam_role_additional_policies = {
         AmazonEBSCSIDriverPolicy = "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"
+        AmazonEKSWorkerNodePolicy = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+        AmazonEKS_CNI_Policy = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
+        AmazonEC2ContainerRegistryReadOnly = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
       }
 
       tags = {
-        "k8s.io/cluster-autoscaler/enabled"             = "true"
+        "k8s.io/cluster-autoscaler/enabled"               = "true"
         "k8s.io/cluster-autoscaler/${local.cluster_name}" = "owned"
       }
     }
@@ -92,11 +118,11 @@ module "eks" {
   tags = local.tags
 }
 
-# IAM role for Cluster Autoscaler
+# IAM role for Cluster Autoscaler - create separate policy instead of inline
 resource "aws_iam_policy" "cluster_autoscaler" {
   name        = "${local.cluster_name}-cluster-autoscaler"
   description = "EKS cluster-autoscaler policy for ${local.cluster_name}"
-  
+
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -115,6 +141,11 @@ resource "aws_iam_policy" "cluster_autoscaler" {
       }
     ]
   })
+}
+
+resource "aws_iam_role_policy_attachment" "cluster_autoscaler" {
+  policy_arn = aws_iam_policy.cluster_autoscaler.arn
+  role       = module.eks.cluster_iam_role_name
 }
 
 # Outputs
