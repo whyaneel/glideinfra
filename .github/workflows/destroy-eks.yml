@@ -35,23 +35,23 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Get Cluster Name
-        id: cluster-name
-        run: |
-          if [[ -f "cluster-status/name.txt" ]]; then
-            STORED_NAME=$(cat cluster-status/name.txt)
-            echo "stored_name=${STORED_NAME}" >> $GITHUB_OUTPUT
-          else
-            echo "stored_name=glide-api-cluster" >> $GITHUB_OUTPUT
-          fi
-          
-          # Use input if provided, otherwise use the stored name
-          CLUSTER_NAME="${{ github.event.inputs.cluster_name }}"
-          if [[ -z "$CLUSTER_NAME" ]]; then
-            CLUSTER_NAME="${STORED_NAME}"
-          fi
-          echo "cluster_name=${CLUSTER_NAME}" >> $GITHUB_OUTPUT
-          echo "Using cluster name: ${CLUSTER_NAME}"
+#      - name: Get Cluster Name
+#        id: cluster-name
+#        run: |
+#          if [[ -f "cluster-status/name.txt" ]]; then
+#            STORED_NAME=$(cat cluster-status/name.txt)
+#            echo "stored_name=${STORED_NAME}" >> $GITHUB_OUTPUT
+#          else
+#            echo "stored_name=glide-api-cluster" >> $GITHUB_OUTPUT
+#          fi
+#
+#          # Use input if provided, otherwise use the stored name
+#          CLUSTER_NAME="${{ github.event.inputs.cluster_name }}"
+#          if [[ -z "$CLUSTER_NAME" ]]; then
+#            CLUSTER_NAME="${STORED_NAME}"
+#          fi
+#          echo "cluster_name=${CLUSTER_NAME}" >> $GITHUB_OUTPUT
+#          echo "Using cluster name: ${CLUSTER_NAME}"
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
