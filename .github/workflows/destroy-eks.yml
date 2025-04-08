@@ -28,30 +28,21 @@ jobs:
     if: "contains(github.event.head_commit.message, '[destroy-eks]') || github.event_name == 'workflow_dispatch'"
 
     env:
+      CLUSTER_NAME: ${{ github.event.inputs.cluster_name || 'glide-api-cluster' }}
       AWS_REGION: ${{ github.event.inputs.region || 'us-east-1' }}
+      TF_VAR_cluster_name: ${{ github.event.inputs.cluster_name || 'glide-api-cluster' }}
       TF_VAR_region: ${{ github.event.inputs.region || 'us-east-1' }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
 
-#      - name: Get Cluster Name
-#        id: cluster-name
-#        run: |
-#          if [[ -f "cluster-status/name.txt" ]]; then
-#            STORED_NAME=$(cat cluster-status/name.txt)
-#            echo "stored_name=${STORED_NAME}" >> $GITHUB_OUTPUT
-#          else
-#            echo "stored_name=glide-api-cluster" >> $GITHUB_OUTPUT
-#          fi
-#
-#          # Use input if provided, otherwise use the stored name
-#          CLUSTER_NAME="${{ github.event.inputs.cluster_name }}"
-#          if [[ -z "$CLUSTER_NAME" ]]; then
-#            CLUSTER_NAME="${STORED_NAME}"
-#          fi
-#          echo "cluster_name=${CLUSTER_NAME}" >> $GITHUB_OUTPUT
-#          echo "Using cluster name: ${CLUSTER_NAME}"
+      - name: Get Cluster Name
+        run: |
+          echo "Using cluster name: ${CLUSTER_NAME}"
+          # Make sure the AWS environment variables are properly set
+          echo "AWS_REGION: ${AWS_REGION}"
+          echo "TF_VAR_cluster_name: ${TF_VAR_cluster_name}"
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -69,7 +60,7 @@ jobs:
         id: check-status
         continue-on-error: true
         run: |
-          if aws eks describe-cluster --name "${{ steps.cluster-name.outputs.cluster_name }}" --region "${{ env.AWS_REGION }}"; then
+          if aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}"; then
             echo "cluster_exists=true" >> $GITHUB_OUTPUT
           else
             echo "cluster_exists=false" >> $GITHUB_OUTPUT
@@ -80,10 +71,10 @@ jobs:
         continue-on-error: true
         run: |
           echo "Cleaning up Kubernetes resources before destroying cluster..."
-          aws eks update-kubeconfig --name "${{ steps.cluster-name.outputs.cluster_name }}" --region "${{ env.AWS_REGION }}"
-          kubectl delete service --all --all-namespaces
-          kubectl delete deployment --all --all-namespaces
-          kubectl delete pod --all --all-namespaces
+          aws eks update-kubeconfig --name "${CLUSTER_NAME}" --region "${AWS_REGION}"
+          kubectl delete service --all --all-namespaces || true
+          kubectl delete deployment --all --all-namespaces || true
+          kubectl delete pod --all --all-namespaces || true
 
       - name: Terraform Init
         working-directory: ./terraform
@@ -91,14 +82,12 @@ jobs:
 
       - name: Terraform Destroy
         working-directory: ./terraform
-        env:
-          TF_VAR_cluster_name: ${{ steps.cluster-name.outputs.cluster_name }}
-        run: terraform destroy -auto-approve
+        run: terraform destroy -auto-approve -var="cluster_name=${CLUSTER_NAME}" -var="region=${AWS_REGION}"
 
       - name: Verify Destruction
         continue-on-error: true
         run: |
-          if ! aws eks describe-cluster --name "${{ steps.cluster-name.outputs.cluster_name }}" --region "${{ env.AWS_REGION }}"; then
+          if ! aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}"; then
             echo "Cluster successfully destroyed!"
           else
             echo "WARNING: Cluster might still be in the process of being destroyed. Check the AWS Console."
@@ -108,8 +97,8 @@ jobs:
         run: |
           mkdir -p cluster-status
           echo "DESTROYED" > cluster-status/status.txt
-          echo "${{ steps.cluster-name.outputs.cluster_name }}" > cluster-status/name.txt
-          echo "${{ env.AWS_REGION }}" > cluster-status/region.txt
+          echo "${CLUSTER_NAME}" > cluster-status/name.txt
+          echo "${AWS_REGION}" > cluster-status/region.txt
           echo "$(date +%s)" > cluster-status/timestamp.txt
 
       - name: Commit Status
