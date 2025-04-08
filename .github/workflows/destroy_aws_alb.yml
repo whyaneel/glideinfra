@@ -1,0 +1,224 @@
+name: Destroy AWS Application Load Balancer Controller
+
+on:
+  push:
+    branches: [ setup ]
+  workflow_dispatch:
+    inputs:
+      cluster_name:
+        description: 'EKS Cluster Name'
+        required: false
+        default: 'glide-api-cluster'
+      region:
+        description: 'AWS Region'
+        required: false
+        default: 'us-east-1'
+
+jobs:
+  destroy-alb-controller:
+    runs-on: ubuntu-latest
+    if: "contains(github.event.head_commit.message, '[destroy-alb]') || github.event_name == 'workflow_dispatch'"
+
+    env:
+      CLUSTER_NAME: ${{ github.event.inputs.cluster_name || 'glide-api-cluster' }}
+      AWS_REGION: ${{ github.event.inputs.region || 'us-east-1' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
+
+      - name: Verify EKS cluster exists
+        id: verify-cluster
+        run: |
+          if aws eks describe-cluster --name ${{ env.CLUSTER_NAME }} --region ${{ env.AWS_REGION }} &> /dev/null; then
+            echo "cluster_exists=true" >> $GITHUB_OUTPUT
+            echo "EKS cluster '${{ env.CLUSTER_NAME }}' exists."
+          else
+            echo "cluster_exists=false" >> $GITHUB_OUTPUT
+            echo "WARNING: EKS cluster '${{ env.CLUSTER_NAME }}' does not exist. Will still clean up any IAM resources."
+          fi
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: 'latest'
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+
+      - name: Install eksctl
+        run: |
+          curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /tmp
+          sudo mv /tmp/eksctl /usr/local/bin
+          eksctl version
+
+      - name: Update kube config
+        if: steps.verify-cluster.outputs.cluster_exists == 'true'
+        run: aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+
+      - name: Find and delete AWS Load Balancers created by the controller
+        if: steps.verify-cluster.outputs.cluster_exists == 'true'
+        run: |
+          echo "Looking for Ingress resources..."
+          INGRESSES=$(kubectl get ingress --all-namespaces -o custom-columns=NAME:.metadata.name,NAMESPACE:.metadata.namespace --no-headers 2>/dev/null || echo "")
+          
+          if [ -n "$INGRESSES" ]; then
+            echo "Found Ingress resources. Deleting them first to ensure Load Balancers are cleaned up..."
+            echo "$INGRESSES" | while read -r ingress_info; do
+              NAME=$(echo $ingress_info | awk '{print $1}')
+              NAMESPACE=$(echo $ingress_info | awk '{print $2}')
+              echo "Deleting Ingress $NAMESPACE/$NAME"
+              kubectl delete ingress $NAME -n $NAMESPACE
+            done
+          
+            # Wait for AWS to clean up load balancers (this can take a minute)
+            echo "Waiting for AWS Load Balancers to be deleted..."
+            sleep 60
+          else
+            echo "No Ingress resources found."
+          fi
+
+      - name: Uninstall AWS Load Balancer Controller
+        if: steps.verify-cluster.outputs.cluster_exists == 'true'
+        run: |
+          echo "Checking if ALB Controller is installed..."
+          if helm list -n kube-system | grep aws-load-balancer-controller; then
+            echo "Uninstalling AWS Load Balancer Controller..."
+            helm uninstall aws-load-balancer-controller -n kube-system
+            echo "Waiting for resources to be cleaned up..."
+            sleep 10
+          else
+            echo "AWS Load Balancer Controller not found in Helm releases."
+          fi
+          
+          # Double-check and forcibly remove any remaining pods
+          if kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-load-balancer-controller 2>/dev/null | grep -q aws-load-balancer-controller; then
+            echo "Forcibly removing ALB Controller pods..."
+            kubectl delete pods -n kube-system -l app.kubernetes.io/name=aws-load-balancer-controller --force --grace-period=0
+          fi
+
+      - name: Delete IAM Service Account
+        run: |
+          if [ "${{ steps.verify-cluster.outputs.cluster_exists }}" == "true" ]; then
+            echo "Deleting IAM Service Account..."
+            eksctl delete iamserviceaccount \
+              --cluster=${{ env.CLUSTER_NAME }} \
+              --namespace=kube-system \
+              --name=aws-load-balancer-controller || echo "IAM Service Account deletion failed or not found."
+          else
+            echo "Skipping IAM Service Account deletion as cluster does not exist."
+          fi
+
+      - name: Check and delete IAM Policy
+        run: |
+          echo "Checking for ALB Controller IAM Policy..."
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          POLICY_ARN="arn:aws:iam::${ACCOUNT_ID}:policy/AWSLoadBalancerControllerIAMPolicy"
+          
+          if aws iam get-policy --policy-arn ${POLICY_ARN} &> /dev/null; then
+            echo "Finding and detaching all policy users..."
+          
+            # Get all roles with this policy attached
+            ROLES=$(aws iam list-entities-for-policy --policy-arn ${POLICY_ARN} --entity-filter Role --query 'PolicyRoles[*].RoleName' --output text || echo "")
+          
+            # Detach policy from all roles
+            if [ -n "$ROLES" ]; then
+              for role in $ROLES; do
+                echo "Detaching policy from role: $role"
+                aws iam detach-role-policy --role-name $role --policy-arn ${POLICY_ARN} || echo "Failed to detach from $role"
+              done
+            fi
+          
+            # Delete non-default policy versions
+            VERSIONS=$(aws iam list-policy-versions --policy-arn ${POLICY_ARN} --query 'Versions[?IsDefaultVersion==`false`].VersionId' --output text || echo "")
+            if [ -n "$VERSIONS" ]; then
+              for version in $VERSIONS; do
+                echo "Deleting policy version: $version"
+                aws iam delete-policy-version --policy-arn ${POLICY_ARN} --version-id $version || echo "Failed to delete version $version"
+              done
+            fi
+          
+            # Delete the policy
+            echo "Deleting IAM Policy: ${POLICY_ARN}"
+            aws iam delete-policy --policy-arn ${POLICY_ARN} || echo "Failed to delete policy"
+          else
+            echo "ALB Controller IAM Policy not found."
+          fi
+
+      - name: Check for remaining resources
+        if: steps.verify-cluster.outputs.cluster_exists == 'true'
+        run: |
+          echo "Checking for any remaining ALB Controller resources..."
+          
+          echo "Checking for service accounts:"
+          kubectl get serviceaccounts -n kube-system | grep aws-load-balancer-controller || echo "No service accounts found."
+          
+          echo "Checking for clusterroles:"
+          kubectl get clusterroles | grep aws-load-balancer-controller || echo "No cluster roles found."
+          
+          echo "Checking for clusterrolebindings:"
+          kubectl get clusterrolebindings | grep aws-load-balancer-controller || echo "No cluster role bindings found."
+          
+          echo "Checking for validating webhooks:"
+          kubectl get validatingwebhookconfigurations | grep aws-load-balancer-controller || echo "No validating webhooks found."
+          
+          echo "Checking for custom resource definitions:"
+          kubectl get crds | grep elbv2 || echo "No ALB related CRDs found."
+
+      - name: Clean up any remaining resources
+        if: steps.verify-cluster.outputs.cluster_exists == 'true'
+        run: |
+          # Delete any remaining service accounts
+          kubectl delete serviceaccount -n kube-system aws-load-balancer-controller 2>/dev/null || true
+          
+          # Delete any webhook configurations
+          kubectl delete validatingwebhookconfigurations aws-load-balancer-controller-webhook 2>/dev/null || true
+          
+          # Delete any cluster roles and bindings
+          kubectl delete clusterrole aws-load-balancer-controller-role 2>/dev/null || true
+          kubectl delete clusterrolebinding aws-load-balancer-controller-rolebinding 2>/dev/null || true
+          
+          # Remove any lingering CRDs (only if we're sure they're from ALB controller)
+          kubectl get crds | grep elbv2 | awk '{print $1}' | xargs -r kubectl delete crd 2>/dev/null || true
+
+      - name: Update documentation
+        run: |
+          if [ -f "ALB_CONTROLLER_USAGE.md" ]; then
+            echo "Updating ALB Controller documentation..."
+            cat > ALB_CONTROLLER_USAGE.md << EOF
+          # AWS Load Balancer Controller
+          
+          The AWS Load Balancer Controller has been removed from your EKS cluster.
+          
+          If you need to reinstall it, run the setup workflow with the tag [setup-alb] in your commit message.
+          EOF
+          
+            git config --global user.name 'GitHub Actions'
+            git config --global user.email 'actions@github.com'
+            git add ALB_CONTROLLER_USAGE.md
+            git commit -m "Update ALB Controller documentation after removal [skip ci]" || echo "No changes to commit"
+            git push || echo "Failed to push changes"
+          else
+            echo "ALB Controller documentation not found. No updates needed."
+          fi
+
+      - name: Final confirmation
+        run: |
+          echo "✅ AWS Load Balancer Controller removal process completed."
+          echo "Resources that have been cleaned up:"
+          echo "- Helm release for AWS Load Balancer Controller"
+          echo "- IAM Service Account in EKS"
+          echo "- IAM Policy for the Load Balancer Controller"
+          echo "- Kubernetes resources (pods, service accounts, webhooks, etc.)"
+          echo ""
+          echo "Note: Some AWS resources like Load Balancers may take additional time to be fully deleted by AWS."
