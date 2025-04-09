@@ -1,12 +1,8 @@
-name: Provision EKS Cluster with ALB Controller
+name: Setup AWS Application Load Balancer Controller
 
 on:
   push:
-    branches:
-      - setup
-    paths:
-      - 'terraform/**'
-      - '.github/workflows/provision-eks.yml'
+    branches: [ setup ]
   workflow_dispatch:
     inputs:
       cluster_name:
@@ -17,168 +13,22 @@ on:
         description: 'AWS Region'
         required: false
         default: 'us-east-1'
-      setup_alb:
-        description: 'Set up ALB Controller'
-        required: false
-        default: true
-        type: boolean
 
 jobs:
-  setup-eks:
+  setup-alb-controller:
     runs-on: ubuntu-latest
-    if: "contains(github.event.head_commit.message, '[provision-eks]') || github.event_name == 'workflow_dispatch'"
-    outputs:
-      cluster_created: ${{ steps.cluster-validation.outputs.cluster_created }}
-      cluster_name: ${{ env.CLUSTER_NAME }}
-      region: ${{ env.AWS_REGION }}
+    if: "contains(github.event.head_commit.message, '[setup-alb]') || github.event_name == 'workflow_dispatch'"
 
     env:
       CLUSTER_NAME: ${{ github.event.inputs.cluster_name || 'glide-api-cluster' }}
       AWS_REGION: ${{ github.event.inputs.region || 'us-east-1' }}
-      TF_VAR_cluster_name: ${{ github.event.inputs.cluster_name || 'glide-api-cluster' }}
-      TF_VAR_region: ${{ github.event.inputs.region || 'us-east-1' }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: "1.5.7"
-
-      - name: Terraform Init
-        working-directory: ./terraform
-        run: terraform init
-
-      - name: Terraform Validate
-        working-directory: ./terraform
-        run: terraform validate
-
-      - name: Terraform Plan
-        working-directory: ./terraform
-        run: terraform plan -var="cluster_name=${CLUSTER_NAME}" -var="region=${AWS_REGION}" -out=tfplan
-
-      - name: Terraform Apply
-        working-directory: ./terraform
-        run: terraform apply -auto-approve tfplan
-
-      - name: Setup kubectl
-        uses: azure/setup-kubectl@v3
-        with:
-          version: 'latest'
-
-      - name: Configure kubectl
-        run: |
-          aws eks update-kubeconfig --name "${CLUSTER_NAME}" --region "${AWS_REGION}"
-          echo "Checking for nodes in the cluster..."
-          kubectl get nodes -o wide || echo "No nodes found yet, but continuing..."
-
-      - name: Deploy Metrics Server
-        run: |
-          echo "Deploying Metrics Server..."
-          kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
-
-      - name: Wait for nodes to be ready
-        run: |
-          echo "Waiting for nodes to appear and become ready..."
-          
-          # Function to check if nodes are ready
-          check_nodes_ready() {
-            NODES=$(kubectl get nodes -o json | jq -r '.items | length')
-            READY_NODES=$(kubectl get nodes -o json | jq -r '.items[] | select(.status.conditions[] | select(.type=="Ready" and .status=="True")) | .metadata.name' | wc -l)
-            
-            if [ "$NODES" -gt 0 ] && [ "$NODES" -eq "$READY_NODES" ]; then
-              return 0
-            else
-              return 1
-            fi
-          }
-          
-          # Try for up to 5 minutes
-          for i in {1..30}; do
-            if check_nodes_ready; then
-              echo "All nodes are ready!"
-              break
-            fi
-            
-            echo "Waiting for nodes to become ready (attempt $i/30)..."
-            if [ $i -eq 30 ]; then
-              echo "Warning: Not all nodes are ready after timeout. Continuing anyway..."
-            fi
-            
-            sleep 10
-          done
-
-      - name: Cluster Validation
-        id: cluster-validation
-        run: |
-          echo "Validating EKS cluster..."
-          
-          if aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" &> /dev/null; then
-            echo "EKS control plane is available."
-            
-            # Check if nodes exist
-            NODE_COUNT=$(kubectl get nodes --no-headers 2>/dev/null | wc -l || echo "0")
-            
-            if [ "$NODE_COUNT" -gt 0 ]; then
-              echo "cluster_created=true" >> $GITHUB_OUTPUT
-              echo "EKS cluster '${CLUSTER_NAME}' successfully created with $NODE_COUNT nodes."
-            else
-              echo "cluster_created=false" >> $GITHUB_OUTPUT
-              echo "EKS control plane exists but no nodes are running."
-            fi
-          else
-            echo "cluster_created=false" >> $GITHUB_OUTPUT
-            echo "EKS cluster creation failed."
-          fi
-
-      - name: Cluster Info
-        run: |
-          echo "EKS Cluster '${CLUSTER_NAME}' deployed in region '${AWS_REGION}'"
-          echo "Cluster nodes:"
-          kubectl get nodes
-          echo "Cluster pods:"
-          kubectl get pods --all-namespaces
-
-      - name: Create Status File
-        run: |
-          mkdir -p cluster-status
-          echo "ACTIVE" > cluster-status/status.txt
-          echo "${CLUSTER_NAME}" > cluster-status/name.txt
-          echo "${AWS_REGION}" > cluster-status/region.txt
-          echo "$(date +%s)" > cluster-status/timestamp.txt
-
-      - name: Commit Status
-        run: |
-          git config --global user.name 'GitHub Actions'
-          git config --global user.email 'whyaneel@gmail.com'
-          git add cluster-status/
-          git commit -m "Update cluster status to ACTIVE [skip ci]" || echo "No changes to commit"
-          git push || echo "Failed to push changes"
-
-  setup-alb-controller:
-    needs: setup-eks
-    if: needs.setup-eks.outputs.cluster_created == 'true' && (github.event.inputs.setup_alb != 'false')
-    runs-on: ubuntu-latest
-    
-    env:
-      CLUSTER_NAME: ${{ needs.setup-eks.outputs.cluster_name }}
-      AWS_REGION: ${{ needs.setup-eks.outputs.region }}
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v2
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -340,13 +190,5 @@ jobs:
           
           # Clean up test ingress
           kubectl delete ingress test-alb
-
-      - name: Final status update
-        run: |
-          echo "✅ EKS Cluster with ALB Controller setup complete!"
-          echo "Cluster name: ${{ env.CLUSTER_NAME }}"
-          echo "Region: ${{ env.AWS_REGION }}"
-          echo "ALB Controller status:"
-          kubectl get deployment -n kube-system aws-load-balancer-controller
           
-          # Apr 09 2025 04
+          # 9th Apr 2025 03
