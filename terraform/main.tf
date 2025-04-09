@@ -58,41 +58,18 @@ resource "aws_cloudwatch_log_group" "eks" {
   tags              = local.tags
 }
 
-# Try to find existing KMS alias, but don't fail if it doesn't exist
-locals {
-  kms_alias_exists = try(
-    # Try to get the alias data
-    length(data.aws_kms_alias.eks_key[0].target_key_id) > 0,
-    # Return false if the above fails
-    false
-  )
-}
-
-# Use data source with count=0 if it will fail, or count=1 if it will succeed
-data "aws_kms_alias" "eks_key" {
-  count = local.kms_alias_exists ? 1 : 0
-  name  = "alias/eks/${local.cluster_name}"
-}
-
-# Create a KMS key only if the alias doesn't exist
+# Create a KMS key with a unique suffix - avoid checking for existing alias
 resource "aws_kms_key" "eks" {
-  count                   = local.kms_alias_exists ? 0 : 1
   description             = "KMS key for EKS cluster encryption"
   deletion_window_in_days = 7
   enable_key_rotation     = true
   tags                    = local.tags
 }
 
-# Don't create the alias if it already exists
+# Create unique alias with a suffix to avoid conflicts
 resource "aws_kms_alias" "eks" {
-  count         = local.kms_alias_exists ? 0 : 1
-  name          = "alias/eks/${local.cluster_name}"
-  target_key_id = aws_kms_key.eks[0].key_id
-}
-
-# Get the correct KMS key ARN either from existing or created key
-locals {
-  kms_key_arn = local.kms_alias_exists ? data.aws_kms_alias.eks_key[0].target_key_arn : aws_kms_key.eks[0].arn
+  name          = "alias/eks/${local.cluster_name}-${random_string.suffix.result}"
+  target_key_id = aws_kms_key.eks.key_id
 }
 
 # EKS Cluster
@@ -112,9 +89,9 @@ module "eks" {
   cloudwatch_log_group_kms_key_id = null
   cloudwatch_log_group_retention_in_days = 7
 
-  # Use custom KMS key for encryption (existing or new)
+  # Use custom KMS key for encryption
   cluster_encryption_config = {
-    provider_key_arn = local.kms_key_arn
+    provider_key_arn = aws_kms_key.eks.arn
     resources        = ["secrets"]
   }
 
@@ -217,5 +194,5 @@ output "setup_kubectl" {
 
 output "cost_optimization_note" {
   description = "Cost optimization note"
-  value       = "Remember to run ./destroy_glideinfra.sh when you're done to avoid unnecessary charges!"
+  value       = "Remember to run teardown-eks.yml when you're done to avoid unnecessary charges!"
 }

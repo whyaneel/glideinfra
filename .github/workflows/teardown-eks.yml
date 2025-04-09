@@ -1,4 +1,4 @@
-name: Teardown EKS Cluster
+name: Teardown EKS Cluster & ALB Controller
 
 on:
   push:
@@ -16,17 +16,29 @@ on:
         description: 'AWS Region'
         required: false
         default: 'us-east-1'
+      teardown_alb_only:
+        description: 'Teardown ALB Controller only (keep cluster)'
+        required: false
+        default: false
+        type: boolean
+      teardown_cluster_only:
+        description: 'Teardown EKS Cluster only (skip ALB cleanup)'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
-  teardown-eks:
+  teardown-resources:
     runs-on: ubuntu-latest
-    if: "contains(github.event.head_commit.message, '[teardown-eks]') || github.event_name == 'workflow_dispatch'"
+    if: "contains(github.event.head_commit.message, '[teardown-eks]') || contains(github.event.head_commit.message, '[teardown-alb]') || github.event_name == 'workflow_dispatch'"
     
     env:
       CLUSTER_NAME: ${{ github.event.inputs.cluster_name || 'glide-api-cluster' }}
       AWS_REGION: ${{ github.event.inputs.region || 'us-east-1' }}
       TF_VAR_cluster_name: ${{ github.event.inputs.cluster_name || 'glide-api-cluster' }}
       TF_VAR_region: ${{ github.event.inputs.region || 'us-east-1' }}
+      TEARDOWN_ALB_ONLY: ${{ github.event.inputs.teardown_alb_only == 'true' || contains(github.event.head_commit.message, '[teardown-alb]') }}
+      TEARDOWN_CLUSTER_ONLY: ${{ github.event.inputs.teardown_cluster_only == 'true' }}
     
     steps:
       - name: Checkout code
@@ -40,12 +52,34 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           mask-aws-account-id: true
 
+      - name: Print teardown mode
+        run: |
+          if [ "${{ env.TEARDOWN_ALB_ONLY }}" = "true" ]; then
+            echo "TEARDOWN MODE: ALB Controller only (keeping EKS cluster)"
+          elif [ "${{ env.TEARDOWN_CLUSTER_ONLY }}" = "true" ]; then
+            echo "TEARDOWN MODE: EKS Cluster only (skipping ALB Controller cleanup)"
+          else
+            echo "TEARDOWN MODE: Complete - both ALB Controller and EKS Cluster"
+          fi
+
       - name: Setup kubectl
         uses: azure/setup-kubectl@v3
         with:
           version: 'latest'
 
+      - name: Setup Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: 'latest'
+
+      - name: Install eksctl
+        run: |
+          curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /tmp
+          sudo mv /tmp/eksctl /usr/local/bin
+          eksctl version
+
       - name: Setup Terraform
+        if: env.TEARDOWN_ALB_ONLY != 'true'
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.5.7"
@@ -59,7 +93,7 @@ jobs:
             echo "Cluster '${CLUSTER_NAME}' exists. Proceeding with teardown."
           else
             echo "cluster_exists=false" >> $GITHUB_OUTPUT
-            echo "Cluster '${CLUSTER_NAME}' doesn't exist. Will still run Terraform destroy to clean up any remaining resources."
+            echo "Cluster '${CLUSTER_NAME}' doesn't exist. Will still run cleanup for any remaining resources."
           fi
 
       - name: Update kubeconfig
@@ -68,8 +102,157 @@ jobs:
           aws eks update-kubeconfig --name "${CLUSTER_NAME}" --region "${AWS_REGION}"
           kubectl get nodes || echo "Failed to get nodes, but will continue cleanup"
 
+      # =========== ALB CONTROLLER TEARDOWN STEPS ===========
+      - name: Find and delete AWS Load Balancers created by the controller
+        if: steps.check-cluster.outputs.cluster_exists == 'true' && env.TEARDOWN_CLUSTER_ONLY != 'true'
+        continue-on-error: true
+        run: |
+          echo "Looking for Ingress resources..."
+          INGRESSES=$(kubectl get ingress --all-namespaces -o custom-columns=NAME:.metadata.name,NAMESPACE:.metadata.namespace --no-headers 2>/dev/null || echo "")
+          
+          if [ -n "$INGRESSES" ]; then
+            echo "Found Ingress resources. Deleting them first to ensure Load Balancers are cleaned up..."
+            echo "$INGRESSES" | while read -r ingress_info; do
+              NAME=$(echo $ingress_info | awk '{print $1}')
+              NAMESPACE=$(echo $ingress_info | awk '{print $2}')
+              echo "Deleting Ingress $NAMESPACE/$NAME"
+              kubectl delete ingress $NAME -n $NAMESPACE
+            done
+            
+            # Wait for AWS to clean up load balancers
+            echo "Waiting for AWS Load Balancers to be deleted..."
+            sleep 60
+          else
+            echo "No Ingress resources found."
+          fi
+
+      - name: Uninstall AWS Load Balancer Controller
+        if: steps.check-cluster.outputs.cluster_exists == 'true' && env.TEARDOWN_CLUSTER_ONLY != 'true'
+        continue-on-error: true
+        run: |
+          echo "Checking if ALB Controller is installed..."
+          if helm list -n kube-system | grep aws-load-balancer-controller; then
+            echo "Uninstalling AWS Load Balancer Controller..."
+            helm uninstall aws-load-balancer-controller -n kube-system
+            echo "Waiting for resources to be cleaned up..."
+            sleep 10
+          else
+            echo "AWS Load Balancer Controller not found in Helm releases."
+          fi
+          
+          # Double-check and forcibly remove any remaining pods
+          if kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-load-balancer-controller 2>/dev/null | grep -q aws-load-balancer-controller; then
+            echo "Forcibly removing ALB Controller pods..."
+            kubectl delete pods -n kube-system -l app.kubernetes.io/name=aws-load-balancer-controller --force --grace-period=0
+          fi
+
+      - name: Delete ALB Controller IAM Service Account
+        if: steps.check-cluster.outputs.cluster_exists == 'true' && env.TEARDOWN_CLUSTER_ONLY != 'true'
+        continue-on-error: true
+        run: |
+          echo "Deleting IAM Service Account for ALB Controller..."
+          eksctl delete iamserviceaccount \
+            --cluster=${CLUSTER_NAME} \
+            --namespace=kube-system \
+            --name=aws-load-balancer-controller || echo "IAM Service Account deletion failed or not found."
+
+      - name: Check and delete ALB Controller IAM Policy
+        if: env.TEARDOWN_CLUSTER_ONLY != 'true'
+        continue-on-error: true
+        run: |
+          echo "Checking for ALB Controller IAM Policy..."
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          POLICY_ARN="arn:aws:iam::${ACCOUNT_ID}:policy/AWSLoadBalancerControllerIAMPolicy"
+          
+          if aws iam get-policy --policy-arn ${POLICY_ARN} &> /dev/null; then
+            echo "Finding and detaching all policy users..."
+            
+            # Get all roles with this policy attached
+            ROLES=$(aws iam list-entities-for-policy --policy-arn ${POLICY_ARN} --entity-filter Role --query 'PolicyRoles[*].RoleName' --output text || echo "")
+            
+            # Detach policy from all roles
+            if [ -n "$ROLES" ]; then
+              for role in $ROLES; do
+                echo "Detaching policy from role: $role"
+                aws iam detach-role-policy --role-name $role --policy-arn ${POLICY_ARN} || echo "Failed to detach from $role"
+              done
+            fi
+            
+            # Delete non-default policy versions
+            VERSIONS=$(aws iam list-policy-versions --policy-arn ${POLICY_ARN} --query 'Versions[?IsDefaultVersion==`false`].VersionId' --output text || echo "")
+            if [ -n "$VERSIONS" ]; then
+              for version in $VERSIONS; do
+                echo "Deleting policy version: $version"
+                aws iam delete-policy-version --policy-arn ${POLICY_ARN} --version-id $version || echo "Failed to delete version $version"
+              done
+            fi
+            
+            # Delete the policy
+            echo "Deleting IAM Policy: ${POLICY_ARN}"
+            aws iam delete-policy --policy-arn ${POLICY_ARN} || echo "Failed to delete policy"
+          else
+            echo "ALB Controller IAM Policy not found."
+          fi
+
+      - name: Clean up remaining ALB Controller resources
+        if: steps.check-cluster.outputs.cluster_exists == 'true' && env.TEARDOWN_CLUSTER_ONLY != 'true'
+        continue-on-error: true
+        run: |
+          # Delete any remaining service accounts
+          kubectl delete serviceaccount -n kube-system aws-load-balancer-controller 2>/dev/null || true
+          
+          # Delete any webhook configurations
+          kubectl delete validatingwebhookconfigurations aws-load-balancer-controller-webhook 2>/dev/null || true
+          
+          # Delete any cluster roles and bindings
+          kubectl delete clusterrole aws-load-balancer-controller-role 2>/dev/null || true
+          kubectl delete clusterrolebinding aws-load-balancer-controller-rolebinding 2>/dev/null || true
+          
+          # Remove any lingering CRDs (only if we're sure they're from ALB controller)
+          kubectl get crds | grep elbv2 | awk '{print $1}' | xargs -r kubectl delete crd 2>/dev/null || true
+
+      - name: Update ALB documentation
+        if: env.TEARDOWN_CLUSTER_ONLY != 'true'
+        continue-on-error: true
+        run: |
+          if [ -f "ALB_CONTROLLER_USAGE.md" ]; then
+            echo "Updating ALB Controller documentation..."
+            if [ "${{ env.TEARDOWN_ALB_ONLY }}" = "true" ]; then
+              cat > ALB_CONTROLLER_USAGE.md << EOF
+          # AWS Load Balancer Controller
+          
+          The AWS Load Balancer Controller has been removed from your EKS cluster.
+          
+          If you need to reinstall it, run the setup workflow with the tag [setup-alb] in your commit message.
+          EOF
+            else
+              cat > ALB_CONTROLLER_USAGE.md << EOF
+          # AWS Load Balancer Controller
+          
+          The AWS Load Balancer Controller has been removed as part of the EKS cluster teardown.
+          EOF
+            fi
+            
+            git config --global user.name 'GitHub Actions'
+            git config --global user.email 'whyaneel@gmail.com'
+            git add ALB_CONTROLLER_USAGE.md
+            git commit -m "Update ALB Controller documentation after removal [skip ci]" || echo "No changes to commit"
+            git push || echo "Failed to push changes"
+          else
+            echo "ALB Controller documentation not found. No updates needed."
+          fi
+
+      # Skip the remaining steps if we're only tearing down the ALB controller
+      - name: ALB Teardown Confirmation
+        if: env.TEARDOWN_ALB_ONLY == 'true'
+        run: |
+          echo "✅ AWS Load Balancer Controller teardown completed."
+          echo "EKS cluster '${CLUSTER_NAME}' has been preserved as requested."
+          exit 0
+
+      # =========== EKS CLUSTER TEARDOWN STEPS ===========
       - name: Clean up Kubernetes resources
-        if: steps.check-cluster.outputs.cluster_exists == 'true'
+        if: steps.check-cluster.outputs.cluster_exists == 'true' && env.TEARDOWN_ALB_ONLY != 'true'
         continue-on-error: true
         run: |
           echo "Cleaning up Kubernetes resources to prevent potential blockers for deletion..."
@@ -94,30 +277,9 @@ jobs:
           echo "Waiting for AWS resources to begin cleanup..."
           sleep 30
 
-      - name: Remove AWS Load Balancer resources
-        if: steps.check-cluster.outputs.cluster_exists == 'true'
-        continue-on-error: true
-        run: |
-          echo "Checking for ingress resources..."
-          if kubectl get ingress --all-namespaces 2>/dev/null | grep -v "No resources found"; then
-            echo "Removing ingress resources to clean up ALBs..."
-            kubectl delete ingress --all --all-namespaces
-          else
-            echo "No ingress resources found."
-          fi
-          
-          # Check if AWS Load Balancer Controller is installed via helm
-          if kubectl get deployment -n kube-system aws-load-balancer-controller 2>/dev/null; then
-            echo "Uninstalling AWS Load Balancer Controller if installed via Helm..."
-            helm uninstall aws-load-balancer-controller -n kube-system || true
-          fi
-          
-          # Wait for AWS to delete load balancers
-          echo "Waiting for ALB resources to be deleted..."
-          sleep 30
-
       - name: Identify VPC and related resources
         id: identify-vpc
+        if: env.TEARDOWN_ALB_ONLY != 'true'
         continue-on-error: true
         run: |
           if [ "${{ steps.check-cluster.outputs.cluster_exists }}" == "true" ]; then
@@ -143,7 +305,7 @@ jobs:
           fi
 
       - name: Clean up EKS NodeGroups directly
-        if: steps.check-cluster.outputs.cluster_exists == 'true'
+        if: steps.check-cluster.outputs.cluster_exists == 'true' && env.TEARDOWN_ALB_ONLY != 'true'
         continue-on-error: true
         run: |
           echo "Removing EKS NodeGroups directly..."
@@ -167,7 +329,7 @@ jobs:
           fi
 
       - name: Handle LoadBalancers in cluster VPC
-        if: steps.identify-vpc.outputs.vpc_id != ''
+        if: steps.identify-vpc.outputs.vpc_id != '' && env.TEARDOWN_ALB_ONLY != 'true'
         continue-on-error: true
         run: |
           echo "Looking for ELBs in VPC ${{ steps.identify-vpc.outputs.vpc_id }}..."
@@ -203,7 +365,7 @@ jobs:
           sleep 60
 
       - name: Delete EKS Cluster Directly
-        if: steps.check-cluster.outputs.cluster_exists == 'true'
+        if: steps.check-cluster.outputs.cluster_exists == 'true' && env.TEARDOWN_ALB_ONLY != 'true'
         continue-on-error: true
         run: |
           echo "Deleting EKS cluster directly via AWS CLI..."
@@ -218,7 +380,7 @@ jobs:
           echo "EKS cluster has been deleted."
 
       - name: Manually clean up NAT Gateways
-        if: steps.identify-vpc.outputs.vpc_id != ''
+        if: steps.identify-vpc.outputs.vpc_id != '' && env.TEARDOWN_ALB_ONLY != 'true'
         continue-on-error: true
         run: |
           echo "Checking for NAT Gateways in VPC ${{ steps.identify-vpc.outputs.vpc_id }}..."
@@ -239,16 +401,19 @@ jobs:
           fi
 
       - name: Terraform Init
+        if: env.TEARDOWN_ALB_ONLY != 'true'
         working-directory: ./terraform
         run: terraform init
 
       - name: Terraform Destroy
+        if: env.TEARDOWN_ALB_ONLY != 'true'
         working-directory: ./terraform
         run: |
           echo "Running Terraform destroy to clean up all remaining resources..."
           terraform destroy -auto-approve -var="cluster_name=${CLUSTER_NAME}" -var="region=${AWS_REGION}"
 
       - name: Verify all resources are removed
+        if: env.TEARDOWN_ALB_ONLY != 'true'
         run: |
           echo "Verifying all resources have been removed..."
           
@@ -302,6 +467,7 @@ jobs:
           fi
 
       - name: Update Status File
+        if: env.TEARDOWN_ALB_ONLY != 'true'
         run: |
           mkdir -p cluster-status
           echo "DESTROYED" > cluster-status/status.txt
@@ -310,11 +476,20 @@ jobs:
           echo "$(date +%s)" > cluster-status/timestamp.txt
 
       - name: Commit Status
+        if: env.TEARDOWN_ALB_ONLY != 'true'
         run: |
           git config --global user.name 'GitHub Actions'
           git config --global user.email 'whyaneel@gmail.com'
           git add cluster-status/
           git commit -m "Update cluster status to DESTROYED [skip ci]" || echo "No changes to commit"
           git push || echo "Failed to push changes"
-          
-          # Apr 09 2025 02
+
+      - name: Final Status Report
+        run: |
+          if [ "${{ env.TEARDOWN_ALB_ONLY }}" = "true" ]; then
+            echo "✅ ALB Controller teardown completed. EKS cluster was preserved."
+          elif [ "${{ env.TEARDOWN_CLUSTER_ONLY }}" = "true" ]; then
+            echo "✅ EKS Cluster teardown completed. ALB Controller cleanup was skipped."
+          else
+            echo "✅ Complete teardown of both ALB Controller and EKS Cluster completed."
+          fi
