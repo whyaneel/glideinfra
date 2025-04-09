@@ -58,34 +58,41 @@ resource "aws_cloudwatch_log_group" "eks" {
   tags              = local.tags
 }
 
-# Check if KMS key exists
-data "aws_kms_alias" "eks_key" {
-  name = "alias/eks/${local.cluster_name}"
-
-  # This makes the data source optional - it will return empty if not found
-  # rather than causing an error
-  count = try(data.aws_kms_alias.eks_key.target_key_id, null) != null ? 1 : 0
+# Try to find existing KMS alias, but don't fail if it doesn't exist
+locals {
+  kms_alias_exists = try(
+    # Try to get the alias data
+    length(data.aws_kms_alias.eks_key[0].target_key_id) > 0,
+    # Return false if the above fails
+    false
+  )
 }
 
-# Create a KMS key if it doesn't exist
+# Use data source with count=0 if it will fail, or count=1 if it will succeed
+data "aws_kms_alias" "eks_key" {
+  count = local.kms_alias_exists ? 1 : 0
+  name  = "alias/eks/${local.cluster_name}"
+}
+
+# Create a KMS key only if the alias doesn't exist
 resource "aws_kms_key" "eks" {
-  count                   = length(data.aws_kms_alias.eks_key) > 0 ? 0 : 1
+  count                   = local.kms_alias_exists ? 0 : 1
   description             = "KMS key for EKS cluster encryption"
   deletion_window_in_days = 7
   enable_key_rotation     = true
   tags                    = local.tags
 }
 
-# Use existing KMS key if it exists, otherwise use the one we create
-locals {
-  kms_key_id = length(data.aws_kms_alias.eks_key) > 0 ? data.aws_kms_alias.eks_key[0].target_key_id : try(aws_kms_key.eks[0].key_id, null)
-}
-
 # Don't create the alias if it already exists
 resource "aws_kms_alias" "eks" {
-  count         = length(data.aws_kms_alias.eks_key) > 0 ? 0 : 1
+  count         = local.kms_alias_exists ? 0 : 1
   name          = "alias/eks/${local.cluster_name}"
   target_key_id = aws_kms_key.eks[0].key_id
+}
+
+# Get the correct KMS key ARN either from existing or created key
+locals {
+  kms_key_arn = local.kms_alias_exists ? data.aws_kms_alias.eks_key[0].target_key_arn : aws_kms_key.eks[0].arn
 }
 
 # EKS Cluster
@@ -106,10 +113,10 @@ module "eks" {
   cloudwatch_log_group_retention_in_days = 7
 
   # Use custom KMS key for encryption (existing or new)
-  cluster_encryption_config = local.kms_key_id != null ? {
-    provider_key_arn = local.kms_key_id
+  cluster_encryption_config = {
+    provider_key_arn = local.kms_key_arn
     resources        = ["secrets"]
-  } : {}
+  }
 
   # Disable KMS key and alias creation in the EKS module
   create_kms_key = false
@@ -122,7 +129,7 @@ module "eks" {
   # Use spot instances for cost savings
   eks_managed_node_groups = {
     main = {
-      name = "node-group-1"
+      name = "node-group-1-${random_string.suffix.result}"
 
       instance_types = [var.instance_type]
       capacity_type  = var.use_spot_instances ? "SPOT" : "ON_DEMAND"
