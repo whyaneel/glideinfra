@@ -58,6 +58,36 @@ resource "aws_cloudwatch_log_group" "eks" {
   tags              = local.tags
 }
 
+# Check if KMS key exists
+data "aws_kms_alias" "eks_key" {
+  name = "alias/eks/${local.cluster_name}"
+
+  # This makes the data source optional - it will return empty if not found
+  # rather than causing an error
+  count = try(data.aws_kms_alias.eks_key.target_key_id, null) != null ? 1 : 0
+}
+
+# Create a KMS key if it doesn't exist
+resource "aws_kms_key" "eks" {
+  count                   = length(data.aws_kms_alias.eks_key) > 0 ? 0 : 1
+  description             = "KMS key for EKS cluster encryption"
+  deletion_window_in_days = 7
+  enable_key_rotation     = true
+  tags                    = local.tags
+}
+
+# Use existing KMS key if it exists, otherwise use the one we create
+locals {
+  kms_key_id = length(data.aws_kms_alias.eks_key) > 0 ? data.aws_kms_alias.eks_key[0].target_key_id : try(aws_kms_key.eks[0].key_id, null)
+}
+
+# Don't create the alias if it already exists
+resource "aws_kms_alias" "eks" {
+  count         = length(data.aws_kms_alias.eks_key) > 0 ? 0 : 1
+  name          = "alias/eks/${local.cluster_name}"
+  target_key_id = aws_kms_key.eks[0].key_id
+}
+
 # EKS Cluster
 module "eks" {
   source  = "terraform-aws-modules/eks/aws"
@@ -74,6 +104,15 @@ module "eks" {
   cluster_enabled_log_types   = ["api", "audit", "authenticator", "controllerManager", "scheduler"]
   cloudwatch_log_group_kms_key_id = null
   cloudwatch_log_group_retention_in_days = 7
+
+  # Use custom KMS key for encryption (existing or new)
+  cluster_encryption_config = local.kms_key_id != null ? {
+    provider_key_arn = local.kms_key_id
+    resources        = ["secrets"]
+  } : {}
+
+  # Disable KMS key and alias creation in the EKS module
+  create_kms_key = false
 
   # Override the default log group with our custom one
   cluster_additional_security_group_ids = []
@@ -94,7 +133,7 @@ module "eks" {
 
       # IAM - use separate IAM policies instead of inline policies
       create_iam_role = true
-      iam_role_name   = "${local.cluster_name}-node-group-role"
+      iam_role_name   = "${local.cluster_name}-node-group-role-${random_string.suffix.result}"
       iam_role_use_name_prefix = false
 
       # Avoid inline policies - instead create explicit IAM policies
@@ -112,15 +151,15 @@ module "eks" {
     }
   }
 
-  # Manage aws-auth configmap
-  manage_aws_auth_configmap = true
+  # Only attempt to manage aws-auth configmap if the cluster exists and is reachable
+  manage_aws_auth_configmap = false
 
   tags = local.tags
 }
 
 # IAM role for Cluster Autoscaler - create separate policy instead of inline
 resource "aws_iam_policy" "cluster_autoscaler" {
-  name        = "${local.cluster_name}-cluster-autoscaler"
+  name        = "${local.cluster_name}-cluster-autoscaler-${random_string.suffix.result}"
   description = "EKS cluster-autoscaler policy for ${local.cluster_name}"
 
   policy = jsonencode({
