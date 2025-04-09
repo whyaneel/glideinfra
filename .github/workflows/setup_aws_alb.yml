@@ -190,3 +190,5 @@ jobs:
           
           # Clean up test ingress
           kubectl delete ingress test-alb
+          
+          # 9th Apr 2025 02
