@@ -13,7 +13,7 @@ variable "cluster_name" {
 variable "kubernetes_version" {
   description = "Kubernetes version"
   type        = string
-  default     = "1.28"
+  default     = "1.29"
 }
 
 variable "vpc_cidr" {
@@ -49,5 +49,5 @@ variable "desired_nodes" {
 variable "use_spot_instances" {
   description = "Use spot instances for worker nodes (cheaper but can be terminated)"
   type        = bool
-  default     = true
+  default     = false
 }

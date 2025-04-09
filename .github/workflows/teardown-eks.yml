@@ -1,0 +1,318 @@
+name: Teardown EKS Cluster
+
+on:
+  push:
+    branches:
+      - setup
+    paths:
+      - '.github/workflows/teardown-eks.yml'
+  workflow_dispatch:
+    inputs:
+      cluster_name:
+        description: 'EKS Cluster Name'
+        required: false
+        default: 'glide-api-cluster'
+      region:
+        description: 'AWS Region'
+        required: false
+        default: 'us-east-1'
+
+jobs:
+  teardown-eks:
+    runs-on: ubuntu-latest
+    if: "contains(github.event.head_commit.message, '[teardown-eks]') || github.event_name == 'workflow_dispatch'"
+    
+    env:
+      CLUSTER_NAME: ${{ github.event.inputs.cluster_name || 'glide-api-cluster' }}
+      AWS_REGION: ${{ github.event.inputs.region || 'us-east-1' }}
+      TF_VAR_cluster_name: ${{ github.event.inputs.cluster_name || 'glide-api-cluster' }}
+      TF_VAR_region: ${{ github.event.inputs.region || 'us-east-1' }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.5.7"
+
+      - name: Check Cluster Status
+        id: check-cluster
+        continue-on-error: true
+        run: |
+          if aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" &> /dev/null; then
+            echo "cluster_exists=true" >> $GITHUB_OUTPUT
+            echo "Cluster '${CLUSTER_NAME}' exists. Proceeding with teardown."
+          else
+            echo "cluster_exists=false" >> $GITHUB_OUTPUT
+            echo "Cluster '${CLUSTER_NAME}' doesn't exist. Will still run Terraform destroy to clean up any remaining resources."
+          fi
+
+      - name: Update kubeconfig
+        if: steps.check-cluster.outputs.cluster_exists == 'true'
+        run: |
+          aws eks update-kubeconfig --name "${CLUSTER_NAME}" --region "${AWS_REGION}"
+          kubectl get nodes || echo "Failed to get nodes, but will continue cleanup"
+
+      - name: Clean up Kubernetes resources
+        if: steps.check-cluster.outputs.cluster_exists == 'true'
+        continue-on-error: true
+        run: |
+          echo "Cleaning up Kubernetes resources to prevent potential blockers for deletion..."
+          
+          # Delete load balancer services first to clean up ELBs
+          echo "Deleting services that might have created load balancers..."
+          kubectl delete svc --all --all-namespaces || true
+          
+          # Delete all deployments, statefulsets, daemonsets
+          echo "Deleting deployments, statefulsets, and daemonsets..."
+          kubectl delete deploy,sts,ds --all --all-namespaces || true
+          
+          # Delete all pods - just in case
+          echo "Deleting pods..."
+          kubectl delete pods --all --all-namespaces || true
+          
+          # Delete all PVCs and PVs
+          echo "Deleting persistent volume claims and volumes..."
+          kubectl delete pvc,pv --all --all-namespaces || true
+          
+          # Give AWS time to start cleaning up some resources
+          echo "Waiting for AWS resources to begin cleanup..."
+          sleep 30
+
+      - name: Remove AWS Load Balancer resources
+        if: steps.check-cluster.outputs.cluster_exists == 'true'
+        continue-on-error: true
+        run: |
+          echo "Checking for ingress resources..."
+          if kubectl get ingress --all-namespaces 2>/dev/null | grep -v "No resources found"; then
+            echo "Removing ingress resources to clean up ALBs..."
+            kubectl delete ingress --all --all-namespaces
+          else
+            echo "No ingress resources found."
+          fi
+          
+          # Check if AWS Load Balancer Controller is installed via helm
+          if kubectl get deployment -n kube-system aws-load-balancer-controller 2>/dev/null; then
+            echo "Uninstalling AWS Load Balancer Controller if installed via Helm..."
+            helm uninstall aws-load-balancer-controller -n kube-system || true
+          fi
+          
+          # Wait for AWS to delete load balancers
+          echo "Waiting for ALB resources to be deleted..."
+          sleep 30
+
+      - name: Identify VPC and related resources
+        id: identify-vpc
+        continue-on-error: true
+        run: |
+          if [ "${{ steps.check-cluster.outputs.cluster_exists }}" == "true" ]; then
+            # Get VPC ID from the cluster
+            echo "Getting VPC ID from cluster..."
+            VPC_ID=$(aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" --query "cluster.resourcesVpcConfig.vpcId" --output text || echo "")
+            
+            if [ ! -z "$VPC_ID" ] && [ "$VPC_ID" != "None" ]; then
+              echo "vpc_id=${VPC_ID}" >> $GITHUB_OUTPUT
+              echo "Found VPC: ${VPC_ID}"
+            else
+              echo "Failed to get VPC ID from cluster"
+            fi
+          else
+            echo "Cluster doesn't exist, attempting to find VPC by name pattern..."
+            # Try to find VPC by name tag
+            VPC_ID=$(aws ec2 describe-vpcs --filters "Name=tag:Name,Values=*${CLUSTER_NAME}*" --query "Vpcs[0].VpcId" --output text || echo "")
+            
+            if [ "$VPC_ID" != "None" ] && [ ! -z "$VPC_ID" ]; then
+              echo "vpc_id=${VPC_ID}" >> $GITHUB_OUTPUT
+              echo "Found VPC by name pattern: ${VPC_ID}"
+            fi
+          fi
+
+      - name: Clean up EKS NodeGroups directly
+        if: steps.check-cluster.outputs.cluster_exists == 'true'
+        continue-on-error: true
+        run: |
+          echo "Removing EKS NodeGroups directly..."
+          NODEGROUPS=$(aws eks list-nodegroups --cluster-name "${CLUSTER_NAME}" --query "nodegroups[*]" --output text || echo "")
+          
+          if [ ! -z "$NODEGROUPS" ]; then
+            echo "Found NodeGroups: ${NODEGROUPS}"
+            for NODEGROUP in $NODEGROUPS; do
+              echo "Deleting NodeGroup ${NODEGROUP}..."
+              aws eks delete-nodegroup --cluster-name "${CLUSTER_NAME}" --nodegroup-name "${NODEGROUP}"
+              
+              echo "Waiting for NodeGroup deletion to complete..."
+              while aws eks describe-nodegroup --cluster-name "${CLUSTER_NAME}" --nodegroup-name "${NODEGROUP}" &> /dev/null; do
+                echo "NodeGroup ${NODEGROUP} still deleting, waiting 30 seconds..."
+                sleep 30
+              done
+            done
+            echo "All NodeGroups deleted."
+          else
+            echo "No NodeGroups found."
+          fi
+
+      - name: Handle LoadBalancers in cluster VPC
+        if: steps.identify-vpc.outputs.vpc_id != ''
+        continue-on-error: true
+        run: |
+          echo "Looking for ELBs in VPC ${{ steps.identify-vpc.outputs.vpc_id }}..."
+          
+          # Find Classic ELBs in the VPC
+          CLASSIC_ELBS=$(aws elb describe-load-balancers --query "LoadBalancerDescriptions[?VPCId=='${{ steps.identify-vpc.outputs.vpc_id }}'].LoadBalancerName" --output text || echo "")
+          
+          if [ ! -z "$CLASSIC_ELBS" ] && [ "$CLASSIC_ELBS" != "None" ]; then
+            echo "Found Classic ELBs: ${CLASSIC_ELBS}"
+            for ELB in $CLASSIC_ELBS; do
+              echo "Deleting Classic ELB ${ELB}..."
+              aws elb delete-load-balancer --load-balancer-name "${ELB}" || true
+            done
+          else
+            echo "No Classic ELBs found."
+          fi
+          
+          # Find Application/Network Load Balancers in the VPC
+          ALB_NLB_ARNS=$(aws elbv2 describe-load-balancers --query "LoadBalancers[?VpcId=='${{ steps.identify-vpc.outputs.vpc_id }}'].LoadBalancerArn" --output text || echo "")
+          
+          if [ ! -z "$ALB_NLB_ARNS" ] && [ "$ALB_NLB_ARNS" != "None" ]; then
+            echo "Found ALBs/NLBs: ${ALB_NLB_ARNS}"
+            for LB_ARN in $ALB_NLB_ARNS; do
+              echo "Deleting ALB/NLB ${LB_ARN}..."
+              aws elbv2 delete-load-balancer --load-balancer-arn "${LB_ARN}" || true
+            done
+          else
+            echo "No ALBs/NLBs found."
+          fi
+          
+          # Wait for load balancers to be deleted
+          echo "Waiting for load balancers to be deleted..."
+          sleep 60
+
+      - name: Delete EKS Cluster Directly
+        if: steps.check-cluster.outputs.cluster_exists == 'true'
+        continue-on-error: true
+        run: |
+          echo "Deleting EKS cluster directly via AWS CLI..."
+          aws eks delete-cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}"
+          
+          echo "Waiting for cluster deletion to complete (this can take several minutes)..."
+          while aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" &> /dev/null; do
+            echo "Cluster still deleting, waiting 60 seconds..."
+            sleep 60
+          done
+          
+          echo "EKS cluster has been deleted."
+
+      - name: Manually clean up NAT Gateways
+        if: steps.identify-vpc.outputs.vpc_id != ''
+        continue-on-error: true
+        run: |
+          echo "Checking for NAT Gateways in VPC ${{ steps.identify-vpc.outputs.vpc_id }}..."
+          
+          NAT_GATEWAY_IDS=$(aws ec2 describe-nat-gateways --filter "Name=vpc-id,Values=${{ steps.identify-vpc.outputs.vpc_id }}" --query "NatGateways[?State!='deleted'].NatGatewayId" --output text || echo "")
+          
+          if [ ! -z "$NAT_GATEWAY_IDS" ] && [ "$NAT_GATEWAY_IDS" != "None" ]; then
+            echo "Found NAT Gateways: ${NAT_GATEWAY_IDS}"
+            for NAT_ID in $NAT_GATEWAY_IDS; do
+              echo "Deleting NAT Gateway ${NAT_ID}..."
+              aws ec2 delete-nat-gateway --nat-gateway-id "${NAT_ID}"
+            done
+            
+            echo "Waiting for NAT Gateways to be deleted (this can take several minutes)..."
+            sleep 60
+          else
+            echo "No active NAT Gateways found."
+          fi
+
+      - name: Terraform Init
+        working-directory: ./terraform
+        run: terraform init
+
+      - name: Terraform Destroy
+        working-directory: ./terraform
+        run: |
+          echo "Running Terraform destroy to clean up all remaining resources..."
+          terraform destroy -auto-approve -var="cluster_name=${CLUSTER_NAME}" -var="region=${AWS_REGION}"
+
+      - name: Verify all resources are removed
+        run: |
+          echo "Verifying all resources have been removed..."
+          
+          # Check if EKS cluster is gone
+          if ! aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" &> /dev/null; then
+            echo "✅ EKS cluster has been successfully removed."
+          else
+            echo "❌ EKS cluster still exists - may require manual cleanup."
+          fi
+          
+          # Check if the VPC is gone (if we identified it earlier)
+          if [ ! -z "${{ steps.identify-vpc.outputs.vpc_id }}" ]; then
+            if ! aws ec2 describe-vpcs --vpc-ids "${{ steps.identify-vpc.outputs.vpc_id }}" &> /dev/null; then
+              echo "✅ VPC has been successfully removed."
+            else
+              echo "❌ VPC still exists - may require manual cleanup."
+              
+              # Check for remaining resources in the VPC
+              echo "Checking for remaining resources in the VPC..."
+              
+              # Elastic Network Interfaces
+              ENI_COUNT=$(aws ec2 describe-network-interfaces --filters "Name=vpc-id,Values=${{ steps.identify-vpc.outputs.vpc_id }}" --query "length(NetworkInterfaces)" --output text || echo "0")
+              echo "- Network Interfaces remaining: ${ENI_COUNT}"
+              
+              # Security Groups (excluding default)
+              SG_COUNT=$(aws ec2 describe-security-groups --filters "Name=vpc-id,Values=${{ steps.identify-vpc.outputs.vpc_id }}" --query "length(SecurityGroups[?GroupName!='default'])" --output text || echo "0")
+              echo "- Non-default Security Groups remaining: ${SG_COUNT}"
+              
+              # Subnets
+              SUBNET_COUNT=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=${{ steps.identify-vpc.outputs.vpc_id }}" --query "length(Subnets)" --output text || echo "0")
+              echo "- Subnets remaining: ${SUBNET_COUNT}"
+              
+              # Route Tables (excluding main)
+              RT_COUNT=$(aws ec2 describe-route-tables --filters "Name=vpc-id,Values=${{ steps.identify-vpc.outputs.vpc_id }}" --query "length(RouteTables[?Associations[0].Main!=\`true\`])" --output text || echo "0")
+              echo "- Non-main Route Tables remaining: ${RT_COUNT}"
+            fi
+          fi
+          
+          # Check for any error messages in terraform state
+          cd terraform
+          if terraform state list &> /dev/null; then
+            RESOURCE_COUNT=$(terraform state list | wc -l)
+            if [ $RESOURCE_COUNT -gt 0 ]; then
+              echo "❌ Terraform still has ${RESOURCE_COUNT} resources in state. May require manual cleanup."
+              terraform state list
+            else
+              echo "✅ Terraform state is empty. All managed resources have been removed."
+            fi
+          else
+            echo "✅ No Terraform state found. All managed resources have been removed."
+          fi
+
+      - name: Update Status File
+        run: |
+          mkdir -p cluster-status
+          echo "DESTROYED" > cluster-status/status.txt
+          echo "${CLUSTER_NAME}" > cluster-status/name.txt
+          echo "${AWS_REGION}" > cluster-status/region.txt
+          echo "$(date +%s)" > cluster-status/timestamp.txt
+
+      - name: Commit Status
+        run: |
+          git config --global user.name 'GitHub Actions'
+          git config --global user.email 'whyaneel@gmail.com'
+          git add cluster-status/
+          git commit -m "Update cluster status to DESTROYED [skip ci]" || echo "No changes to commit"
+          git push || echo "Failed to push changes"
